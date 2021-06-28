@@ -473,6 +473,7 @@ static void nvme_submit_command(NVMeQueuePair *q, NVMeRequest *req,
 
     trace_nvme_submit_command(q->s, q->index, req->cid);
     nvme_trace_command(cmd);
+	printf("zns reserved: %ld\n", *((uint64_t*)cmd +1));
     qemu_mutex_lock(&q->lock);
     memcpy((uint8_t *)q->sq.queue +
            q->sq.tail * NVME_SQ_ENTRY_BYTES, cmd, sizeof(*cmd));

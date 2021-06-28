@@ -1,8 +1,49 @@
 #include "./zns.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 
 #define MIN_DISCARD_GRANULARITY     (4 * KiB)
 #define NVME_DEFAULT_ZONE_SIZE      (128 * MiB)
 #define NVME_DEFAULT_MAX_AZ_SIZE    (128 * KiB)
+#define MAX_PLP_SUPPORT_ZONE_NR     10
+#define PRINT_SCALE_UNIT            20
+#define PLP_SCALER					PRINT_SCALE_UNIT / maximum_plp_size
+#define NONE_PLP_SCALER             PRINT_SCALE_UNIT / maximum_none_plp_size
+static uint64_t g_is_plp = 0;
+static uint64_t print_counter = 0;
+static uint64_t current_plp_size = 0;
+static uint64_t current_none_plp_size = 0;
+static uint64_t maximum_plp_size = MAX_PLP_SUPPORT_ZONE_NR * NVME_DEFAULT_ZONE_SIZE;
+static uint64_t maximum_none_plp_size = MAX_PLP_SUPPORT_ZONE_NR * NVME_DEFAULT_ZONE_SIZE;
+
+void print_buffer(void) {
+	int i;
+	print_counter = 0;
+	//clear terminal
+	printf("\e[1;1H\e[2J");
+	printf("==================Buffer==================\n");
+	for (i=0; i<current_plp_size * PLP_SCALER; ++i) {
+		printf("o");
+	}
+	for (i=current_plp_size * PLP_SCALER; i<maximum_plp_size * PLP_SCALER; ++i) {
+		printf(" ");
+	}
+	printf("|");
+	for (i=0; i<current_none_plp_size * NONE_PLP_SCALER; ++i) {
+		printf("o");
+	}
+	for (i=current_none_plp_size * NONE_PLP_SCALER; i<maximum_none_plp_size * NONE_PLP_SCALER; ++i) {
+		printf(" ");
+	}
+	printf("\n==================Buffer==================\n");
+	printf("current_plp_size: %lu\n", current_plp_size);
+
+	if ((current_none_plp_size >= maximum_none_plp_size) || (current_plp_size >= maximum_plp_size)) {
+		current_none_plp_size = 0;
+		current_plp_size = 0;
+	}
+}
 
 static inline uint32_t zns_zone_idx(NvmeNamespace *ns, uint64_t slba)
 {
@@ -851,6 +892,9 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
             return status;
         }
         break;
+	case NVME_ZONE_ACTION_SET_PLP_ZONE:
+		printf("PLP Zone Called: %ld\n", zone->d.zslba/n->zone_size);
+		break;
     default:
         status = NVME_INVALID_FIELD;
     }
@@ -956,8 +1000,12 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
         }
     }
     header = (NvmeZoneReportHeader *)buf;
-    header->nr_zones = cpu_to_le64(nr_zones);
-
+	header->nr_zones = cpu_to_le64(nr_zones);
+	// Maximum PLP support zone number
+	header->rsvd[0] = MAX_PLP_SUPPORT_ZONE_NR;
+	header->rsvd[1] = n->zasl;
+    header->rsvd[2] = n->page_size & 0xff;
+	header->rsvd[3] = n->page_size >> 8;
     buf_p = buf + sizeof(NvmeZoneReportHeader);
     for (; zone_idx < n->num_zones && max_zones > 0; zone_idx++) {
         zone = &n->zone_array[zone_idx];
@@ -970,12 +1018,8 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
             z->zcap = cpu_to_le64(zone->d.zcap);
             z->zslba = cpu_to_le64(zone->d.zslba);
             z->za = zone->d.za;
-
-            if (zns_wp_is_valid(zone)) {
-                z->wp = cpu_to_le64(zone->d.wp);
-            } else {
-                z->wp = cpu_to_le64(~0ULL);
-            }
+			z->rsvd3[0] = g_is_plp;
+			z->wp = cpu_to_le64(zone->d.wp);
 
             if (zra == NVME_ZONE_REPORT_EXTENDED) {
                 if (zone->d.za & NVME_ZA_ZD_EXT_VALID) {
@@ -1026,7 +1070,6 @@ static uint16_t zns_map_dptr(FemuCtrl *n, size_t len, NvmeRequest *req)
     case NVME_PSDT_PRP:
         prp1 = le64_to_cpu(req->cmd.dptr.prp1);
         prp2 = le64_to_cpu(req->cmd.dptr.prp2);
-
         return nvme_map_prp(&req->qsg, &req->iov, prp1, prp2, len, n);
     default:
         return NVME_INVALID_FIELD;
@@ -1034,7 +1077,7 @@ static uint16_t zns_map_dptr(FemuCtrl *n, size_t len, NvmeRequest *req)
 }
 
 static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
-                             bool wrz)
+                             bool wrz, bool plp)
 {
     NvmeRwCmd *rw = (NvmeRwCmd *)&req->cmd;
     NvmeNamespace *ns = req->ns;
@@ -1046,6 +1089,8 @@ static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
     NvmeZonedResult *res = (NvmeZonedResult *)&req->cqe;
     uint16_t status;
 
+	//printf("[%s:%d] reserver 2: %lu\n", __FUNCTION__, __LINE__, (rw->rsvd2) >> 32);
+	printf("[%s:%d] size %lu\n", __FUNCTION__, __LINE__, data_size);
     if (!wrz) {
         status = nvme_check_mdts(n, data_size);
         if (status) {
@@ -1064,7 +1109,6 @@ static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
     if (status) {
         goto err;
     }
-
     status = zns_auto_open_zone(ns, zone);
     if (status) {
         goto err;
@@ -1083,7 +1127,8 @@ static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
         if (status) {
             goto err;
         }
-
+		if (plp) { current_plp_size += data_size; }
+		else { current_none_plp_size += data_size; }
         backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
     }
 
@@ -1091,6 +1136,7 @@ static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
     return NVME_SUCCESS;
 
 err:
+	printf("ErrorCode: %d\n", status);
     printf("****************Append Failed***************\n");
     return status | NVME_DNR;
 }
@@ -1103,9 +1149,11 @@ static uint16_t zns_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
     }
 }
 
-static inline uint16_t zns_zone_append(FemuCtrl *n, NvmeRequest *req)
+static inline uint16_t zns_zone_append(FemuCtrl *n, NvmeRequest *req, bool plp)
 {
-    return zns_do_write(n, req, true, false);
+	uint16_t ret;
+	ret = zns_do_write(n, req, true, false, plp);
+    return ret;
 }
 
 static uint16_t zns_check_dulbe(NvmeNamespace *ns, uint64_t slba, uint32_t nlb)
@@ -1163,7 +1211,7 @@ err:
 }
 
 static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
-                          NvmeRequest *req)
+                          NvmeRequest *req, bool plp)
 {
     NvmeRwCmd *rw = (NvmeRwCmd *)cmd;
     uint64_t slba = le64_to_cpu(rw->slba);
@@ -1173,11 +1221,9 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     NvmeZone *zone;
     NvmeZonedResult *res = (NvmeZonedResult *)&req->cqe;
     uint16_t status;
-
     assert(n->zoned);
     req->is_write = true;
-
-    status = nvme_check_mdts(n, data_size);
+	status = nvme_check_mdts(n, data_size);
     if (status) {
         goto err;
     }
@@ -1207,31 +1253,49 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     if (status) {
         goto err;
     }
-
+	if (plp) { current_plp_size += data_size; }
+	else { current_none_plp_size += data_size; }
     backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
     zns_finalize_zoned_write(ns, req, false);
+	print_buffer();
 
     return NVME_SUCCESS;
 
 err:
     femu_err("*********ZONE WRITE FAILED*********\n");
+	printf("zns write error: %u\n", status);
     return status | NVME_DNR;
 }
 
-static uint16_t zns_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
-                           NvmeRequest *req)
+
+static uint16_t zns_flush(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+                         NvmeRequest *req)
 {
+	//uint64_t is_plp = (cmd->res2 >> 31);
+	current_plp_size       = 0;
+	current_none_plp_size  = 0;
+	print_buffer();
+	return NVME_SUCCESS;
+}
+
+static uint16_t zns_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
+							NvmeRequest *req)                           
+{
+	bool plp = false;
     switch (cmd->opcode) {
+    case NVME_CMD_FLUSH:
+		return zns_flush(n, ns, cmd, req);
     case NVME_CMD_READ:
         return zns_read(n, ns, cmd, req);
     case NVME_CMD_WRITE:
-        return zns_write(n, ns, cmd, req);
+		plp = *((uint64_t *)cmd +1) >> 32;
+        return zns_write(n, ns, cmd, req, plp);
     case NVME_CMD_ZONE_MGMT_SEND:
         return zns_zone_mgmt_send(n, req);
     case NVME_CMD_ZONE_MGMT_RECV:
         return zns_zone_mgmt_recv(n, req);
     case NVME_CMD_ZONE_APPEND:
-        return zns_zone_append(n, req);
+        return zns_zone_append(n, req, plp);
     }
 
     return NVME_INVALID_OPCODE | NVME_DNR;
@@ -1265,7 +1329,6 @@ static int zns_init_zone_cap(FemuCtrl *n)
     n->max_active_zones = 0;
     n->max_open_zones = 0;
     n->zd_extension_size = 0;
-
     return 0;
 }
 
@@ -1298,7 +1361,6 @@ static void zns_init(FemuCtrl *n, Error **errp)
     if (zns_init_zone_geometry(ns, errp) != 0) {
         return;
     }
-
     zns_init_zone_identify(n, ns, 0);
 }
 

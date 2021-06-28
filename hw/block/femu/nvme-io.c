@@ -436,12 +436,6 @@ static uint16_t nvme_compare(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     return NVME_SUCCESS;
 }
 
-static uint16_t nvme_flush(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
-                           NvmeRequest *req)
-{
-    return NVME_SUCCESS;
-}
-
 static uint16_t nvme_write_zeros(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                                  NvmeRequest *req)
 {
@@ -489,11 +483,6 @@ static uint16_t nvme_io_cmd(FemuCtrl *n, NvmeCmd *cmd, NvmeRequest *req)
     req->ns = ns = &n->namespaces[nsid - 1];
 
     switch (cmd->opcode) {
-    case NVME_CMD_FLUSH:
-        if (!n->id_ctrl.vwc || !n->features.volatile_wc) {
-            return NVME_SUCCESS;
-        }
-        return nvme_flush(n, ns, cmd, req);
     case NVME_CMD_DSM:
         if (NVME_ONCS_DSM & n->oncs) {
             return nvme_dsm(n, ns, cmd, req);

@@ -52,6 +52,7 @@ enum NvmeZoneSendAction {
     NVME_ZONE_ACTION_OPEN            = 0x03,
     NVME_ZONE_ACTION_RESET           = 0x04,
     NVME_ZONE_ACTION_OFFLINE         = 0x05,
+	NVME_ZONE_ACTION_SET_PLP_ZONE    = 0x06,
     NVME_ZONE_ACTION_SET_ZD_EXT      = 0x10,
 };
 
@@ -116,6 +117,8 @@ typedef struct NvmeNamespaceParams {
     uint32_t max_open_zones;
     uint32_t zd_extension_size;
 } NvmeNamespaceParams;
+
+void print_buffer(void);
 
 static inline uint32_t zns_nsid(NvmeNamespace *ns)
 {

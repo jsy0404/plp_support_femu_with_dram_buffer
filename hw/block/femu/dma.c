@@ -59,6 +59,7 @@ uint16_t nvme_map_prp(QEMUSGList *qsg, QEMUIOVector *iov, uint64_t prp1,
 
                 if (i == n->max_prp_ents - 1 && len > n->page_size) {
                     if (!prp_ent || prp_ent & (n->page_size - 1)) {
+						printf("1. prp_ent: %lu n->page_size: %u\n", prp_ent, n->page_size);
                         goto unmap;
                     }
 
@@ -71,6 +72,7 @@ uint16_t nvme_map_prp(QEMUSGList *qsg, QEMUIOVector *iov, uint64_t prp1,
                 }
 
                 if (!prp_ent || prp_ent & (n->page_size - 1)) {
+					printf("2. prp_ent: %lu n->page_size: %u\n", prp_ent, n->page_size);
                     goto unmap;
                 }
 
@@ -86,6 +88,7 @@ uint16_t nvme_map_prp(QEMUSGList *qsg, QEMUIOVector *iov, uint64_t prp1,
             }
         } else {
             if (prp2 & (n->page_size - 1)) {
+				printf("prp2: %lu n->page_size: %u\n", prp2, n->page_size);
                 goto unmap;
             }
             if (!cmb) {
@@ -105,7 +108,7 @@ unmap:
     } else {
         qemu_iovec_destroy(iov);
     }
-
+	printf("nvme_map_prp cmb: %d\n", cmb);
     return NVME_INVALID_FIELD | NVME_DNR;
 }
 
