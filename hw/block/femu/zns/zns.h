@@ -2,7 +2,6 @@
 #define __FEMU_ZNS_H
 
 #include "../nvme.h"
-
 typedef struct QEMU_PACKED NvmeZonedResult {
     uint64_t slba;
 } NvmeZonedResult;
@@ -118,7 +117,12 @@ typedef struct NvmeNamespaceParams {
     uint32_t zd_extension_size;
 } NvmeNamespaceParams;
 
+void ReadQSG(SsdDramBackend *, QEMUSGList *, uint64_t *);
+void WriteQSG(SsdDramBackend *, QEMUSGList *, uint64_t *);
 void print_buffer(void);
+int WriteBuffer(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write);
+void flush_buffer(int);
+int SetTimerInterrupt(timer_t *timerID, int sec, int msec);
 
 static inline uint32_t zns_nsid(NvmeNamespace *ns)
 {

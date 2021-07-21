@@ -1,7 +1,14 @@
+#include "./map.h"
+#include "./map.c"
 #include "./zns.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <syslog.h>
+#include <unistd.h>
+#include <assert.h>
+#include <sys/time.h>
+#include <semaphore.h>
 
 #define MIN_DISCARD_GRANULARITY     (4 * KiB)
 #define NVME_DEFAULT_ZONE_SIZE      (128 * MiB)
@@ -10,6 +17,9 @@
 #define PRINT_SCALE_UNIT            20
 #define PLP_SCALER					PRINT_SCALE_UNIT / maximum_plp_size
 #define NONE_PLP_SCALER             PRINT_SCALE_UNIT / maximum_none_plp_size
+#define PRINTBUFFER					0
+#define DRAMBUFFER					1
+
 static uint64_t g_is_plp = 0;
 static uint64_t print_counter = 0;
 static uint64_t current_plp_size = 0;
@@ -17,31 +27,249 @@ static uint64_t current_none_plp_size = 0;
 static uint64_t maximum_plp_size = MAX_PLP_SUPPORT_ZONE_NR * NVME_DEFAULT_ZONE_SIZE;
 static uint64_t maximum_none_plp_size = MAX_PLP_SUPPORT_ZONE_NR * NVME_DEFAULT_ZONE_SIZE;
 
+map_void_t qsg2flashaddr;
+map_void_t qsg2buffer;
+map_int_t qsg2len;
+
+static sigset_t block;
+AddressSpace *as;
+sem_t sem;
+
+void ReadQSG(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal) {
+	int sg_cur_index = 0;
+	dma_addr_t sg_cur_byte = 0;
+	dma_addr_t cur_addr, cur_len;
+	uint64_t mb_oft = lbal[0];
+	void *mb = b->logical_space;
+	void **flash_addr;
+	char *key;
+
+    DMADirection dir = DMA_DIRECTION_FROM_DEVICE;
+
+	while (sg_cur_index < qsg->nsg) {
+		cur_addr = qsg->sg[sg_cur_index].base + sg_cur_byte;
+		cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
+		key = (char *)malloc(sizeof(char)*12);
+		memset(key, 0, 12);
+		sprintf(key, "%ld", cur_addr);
+		flash_addr = map_get(&qsg2flashaddr, key);
+		if (!flash_addr) {
+			//printf("Read1: addr: %ld buffer: %s\n", cur_addr, (char*)(mb + mb_oft));
+			// Data is not in buffer
+			dma_memory_rw(qsg->as, cur_addr, mb + mb_oft, cur_len, dir);
+		} else {
+			//printf("Read2: addr: %ld buffer: %s\n", cur_addr, (char*)*map_get(&qsg2buffer, key));
+			// buffer -> qsg
+			dma_memory_rw(qsg->as, cur_addr, *map_get(&qsg2buffer, key), cur_len, dir);
+		}
+		sg_cur_byte += cur_len;
+		if (sg_cur_byte == qsg->sg[sg_cur_index].len) {
+			sg_cur_byte = 0;
+			++sg_cur_index;
+		}
+
+		mb_oft += cur_len;
+		free(key);
+	}
+	qemu_sglist_destroy(qsg);
+}
+
+void CopyBuffer2Ssd(AddressSpace *as, dma_addr_t addr, const void *buffer, dma_addr_t len) {
+	FlatView *fv;
+	hwaddr addr1;
+	MemoryRegion *mr;
+	hwaddr l;
+	MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+	bool release_lock = false;
+	uint64_t val;
+	MemTxResult result = MEMTX_OK;
+	uint8_t *ram_ptr;
+
+	dma_barrier(as, DMA_DIRECTION_TO_DEVICE);
+
+	if (len > 0) {
+		RCU_READ_LOCK_GUARD();
+
+		l = len;
+
+		fv = address_space_to_flatview(as);
+		mr = flatview_translate(fv, addr, &addr1, &l, false, attrs);
+
+		for (;;) {
+			if (!memory_access_is_direct(mr, false)) {
+				release_lock != prepare_mmio_access(mr);
+				l = memory_access_size(mr, l, addr1);
+				result != memory_region_dispatch_read(mr, addr1, &val, size_memop(l), attrs);
+
+				stn_he_p(buffer, l, val);
+			} else {
+				fuzz_dma_read_cb(addr, len, mr, false);
+				ram_ptr = qemu_ram_ptr_length(mr->ram_block, addr1, &l, false);
+				memcpy(buf, ram_ptr, l);
+			}
+
+			if (release_lock) {
+				qemu_mutex_unlock_iothread();
+				release_lock = false;
+			}
+
+			len -= l;
+			buf += l;
+			addr += l;
+
+			if (!len) {
+				break;
+			}
+
+			l = len;
+			mr = flatview_translate(fv, addr, &addr1, &l, false, attrs);
+		}
+	}
+}
+
+void WriteQSG(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal) {
+	int sg_cur_index = 0;
+	dma_addr_t sg_cur_byte = 0;
+	dma_addr_t cur_addr, cur_len;
+	uint64_t mb_oft = lbal[0];
+	void *mb = b->logical_space;
+	void *buffer;
+	void **flash_addr;
+	char *key;
+
+    DMADirection dir = DMA_DIRECTION_TO_DEVICE;
+
+	while (sg_cur_index < qsg->nsg) {
+		cur_addr = qsg->sg[sg_cur_index].base + sg_cur_byte;
+		cur_len = qsg->sg[sg_cur_index].len - sg_cur_byte;
+
+		key = (char *)malloc(sizeof(char)*12);
+		memset(key, 0, 12);
+		sprintf(key, "%ld", cur_addr);
+		flash_addr = map_get(&qsg2flashaddr, key);
+		if (flash_addr) {
+			//dma_memory_rw(qsg->as, cur_addr, *flash_addr, *map_get(&qsg2len, key), dir);
+			//buffer to qsg
+			CopyBuffer2Ssd(qsg->as, cur_addr, *map_get(&qsg2buffer, key), *map_get(&qsg2len, key));
+			free(*map_get(&qsg2buffer, key));
+
+			map_remove(&qsg2flashaddr, key);
+			map_remove(&qsg2len, key);
+		}
+
+		buffer = (void *)malloc(sizeof(char)*(4096));
+		memset(buffer, 0, 4096);
+
+		// qsg -> buffer
+		dma_memory_rw(qsg->as, cur_addr, buffer, cur_len, dir);
+		//printf("Write: addr: %ld buffer: %s\n", cur_addr, (char*)buffer);
+		map_set(&qsg2flashaddr, key, mb + mb_oft);
+		map_set(&qsg2buffer, key, buffer);
+		map_set(&qsg2len, key, cur_len);
+
+		sg_cur_byte += cur_len;
+		if (sg_cur_byte == qsg->sg[sg_cur_index].len) {
+			sg_cur_byte = 0;
+			++sg_cur_index;
+		}
+
+		mb_oft += cur_len;
+		free(key);
+	}
+
+	qemu_sglist_destroy(qsg);
+}
+
+int WriteBuffer(SsdDramBackend *b, QEMUSGList *qsg, uint64_t *lbal, bool is_write) {
+	sem_wait(&sem);
+	as = qsg->as;
+	if (is_write) {
+		WriteQSG(b, qsg, lbal);	
+	} else {
+		ReadQSG(b, qsg, lbal);
+	}
+
+	sem_post(&sem);
+	return 0;
+}
+
+void flush_buffer(int a) {
+	const char *key;
+	dma_addr_t cur_addr;
+
+	sem_wait(&sem);
+	map_iter_t iter = map_iter(&iter);
+
+	current_plp_size       = 0;
+	current_none_plp_size  = 0;
+
+	while((key = map_next(&qsg2flashaddr, &iter))) {
+		sscanf(key, "%ld", &cur_addr);
+		
+		dma_memory_rw(as, cur_addr, *map_get(&qsg2flashaddr, key), *map_get(&qsg2len, key), true);
+
+		free(*map_get(&qsg2buffer, key));
+
+		map_remove(&qsg2flashaddr, key);
+		map_remove(&qsg2len, key);
+		map_remove(&qsg2buffer, key);
+	}
+
+	print_buffer();
+	sem_post(&sem);
+}
+
+int SetTimerInterrupt(timer_t *timerID, int sec, int msec) {
+    sigemptyset(&block);
+    sigaddset(&block,SIGVTALRM);
+
+	struct sigaction act={0};
+	struct timeval interval;
+	struct itimerval period;
+
+	act.sa_handler=flush_buffer;
+	sigaction(SIGVTALRM, &act, NULL);
+
+	interval.tv_sec=sec;
+	interval.tv_usec=msec*1000;
+	period.it_interval=interval;
+	period.it_value=interval;
+	setitimer(ITIMER_VIRTUAL,&period,NULL);
+
+	return 0;
+}
+
 void print_buffer(void) {
 	int i;
-	print_counter = 0;
-	//clear terminal
-	printf("\e[1;1H\e[2J");
-	printf("==================Buffer==================\n");
-	for (i=0; i<current_plp_size * PLP_SCALER; ++i) {
-		printf("o");
-	}
-	for (i=current_plp_size * PLP_SCALER; i<maximum_plp_size * PLP_SCALER; ++i) {
-		printf(" ");
-	}
-	printf("|");
-	for (i=0; i<current_none_plp_size * NONE_PLP_SCALER; ++i) {
-		printf("o");
-	}
-	for (i=current_none_plp_size * NONE_PLP_SCALER; i<maximum_none_plp_size * NONE_PLP_SCALER; ++i) {
-		printf(" ");
-	}
-	printf("\n==================Buffer==================\n");
-	printf("current_plp_size: %lu\n", current_plp_size);
+	if (PRINTBUFFER) {
+		print_counter = 0;
+		//clear terminal
+		printf("\e[1;1H\e[2J");
+		printf("===================Buffer===================\n");
+		printf("|        plp         |          none       |\n");
+		printf("--------------------------------------------\n|");
+		for (i=0; i<current_plp_size * PLP_SCALER; ++i) {
+			printf("o");
+		}
+		for (i=current_plp_size * PLP_SCALER; i<maximum_plp_size * PLP_SCALER; ++i) {
+			printf(" ");
+		}
+		printf("|");
+		for (i=0; i<current_none_plp_size * NONE_PLP_SCALER; ++i) {
+			printf("o");
+		}
+		for (i=current_none_plp_size * NONE_PLP_SCALER; i<maximum_none_plp_size * NONE_PLP_SCALER; ++i) {
+			printf(" ");
+		}
+		printf(" |\n--------------------------------------------\n");
+		printf("===================Buffer===================\n");
+		printf("plp_size: %8luKiB none_size: %8luKiB\n", current_plp_size/1024, current_none_plp_size/1024);
+		printf("plp_size: %8luMiB none_size: %8luMiB\n", current_plp_size/(1024*1024), current_none_plp_size / (1024*1024));
 
-	if ((current_none_plp_size >= maximum_none_plp_size) || (current_plp_size >= maximum_plp_size)) {
-		current_none_plp_size = 0;
-		current_plp_size = 0;
+		if ((current_none_plp_size >= maximum_none_plp_size) || (current_plp_size >= maximum_plp_size)) {
+			current_none_plp_size = 0;
+			current_plp_size = 0;
+		}
 	}
 }
 
@@ -893,7 +1121,6 @@ static uint16_t zns_zone_mgmt_send(FemuCtrl *n, NvmeRequest *req)
         }
         break;
 	case NVME_ZONE_ACTION_SET_PLP_ZONE:
-		printf("PLP Zone Called: %ld\n", zone->d.zslba/n->zone_size);
 		break;
     default:
         status = NVME_INVALID_FIELD;
@@ -1019,7 +1246,12 @@ static uint16_t zns_zone_mgmt_recv(FemuCtrl *n, NvmeRequest *req)
             z->zslba = cpu_to_le64(zone->d.zslba);
             z->za = zone->d.za;
 			z->rsvd3[0] = g_is_plp;
-			z->wp = cpu_to_le64(zone->d.wp);
+
+			if (zns_wp_is_valid(zone)) {
+				z->wp = cpu_to_le64(zone->d.wp);
+			} else {
+				z->wp = cpu_to_le64(~0ULL);
+			}
 
             if (zra == NVME_ZONE_REPORT_EXTENDED) {
                 if (zone->d.za & NVME_ZA_ZD_EXT_VALID) {
@@ -1089,8 +1321,6 @@ static uint16_t zns_do_write(FemuCtrl *n, NvmeRequest *req, bool append,
     NvmeZonedResult *res = (NvmeZonedResult *)&req->cqe;
     uint16_t status;
 
-	//printf("[%s:%d] reserver 2: %lu\n", __FUNCTION__, __LINE__, (rw->rsvd2) >> 32);
-	printf("[%s:%d] size %lu\n", __FUNCTION__, __LINE__, data_size);
     if (!wrz) {
         status = nvme_check_mdts(n, data_size);
         if (status) {
@@ -1202,8 +1432,12 @@ static uint16_t zns_read(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     }
 
     data_offset = zns_l2b(ns, slba);
-
-    backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
+	
+	if (DRAMBUFFER) {
+		WriteBuffer(n->mbe, &req->qsg, &data_offset, req->is_write);
+	} else {
+		backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
+	}
     return NVME_SUCCESS;
 
 err:
@@ -1240,7 +1474,7 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
         goto err;
     }
 
-    status = zns_auto_open_zone(ns, zone);
+	status = zns_auto_open_zone(ns, zone);
     if (status) {
         goto err;
     }
@@ -1255,7 +1489,12 @@ static uint16_t zns_write(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     }
 	if (plp) { current_plp_size += data_size; }
 	else { current_none_plp_size += data_size; }
-    backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
+
+	if (DRAMBUFFER) {
+		WriteBuffer(n->mbe, &req->qsg, &data_offset, req->is_write);
+	} else {
+		backend_rw(n->mbe, &req->qsg, &data_offset, req->is_write);
+	}
     zns_finalize_zoned_write(ns, req, false);
 	print_buffer();
 
@@ -1271,10 +1510,7 @@ err:
 static uint16_t zns_flush(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
                          NvmeRequest *req)
 {
-	//uint64_t is_plp = (cmd->res2 >> 31);
-	current_plp_size       = 0;
-	current_none_plp_size  = 0;
-	print_buffer();
+	flush_buffer(0);
 	return NVME_SUCCESS;
 }
 
@@ -1286,15 +1522,20 @@ static uint16_t zns_io_cmd(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
     case NVME_CMD_FLUSH:
 		return zns_flush(n, ns, cmd, req);
     case NVME_CMD_READ:
+		flush_buffer(0);
         return zns_read(n, ns, cmd, req);
     case NVME_CMD_WRITE:
+		flush_buffer(0);
 		plp = *((uint64_t *)cmd +1) >> 32;
         return zns_write(n, ns, cmd, req, plp);
     case NVME_CMD_ZONE_MGMT_SEND:
+		flush_buffer(0);
         return zns_zone_mgmt_send(n, req);
     case NVME_CMD_ZONE_MGMT_RECV:
+		flush_buffer(0);
         return zns_zone_mgmt_recv(n, req);
     case NVME_CMD_ZONE_APPEND:
+		flush_buffer(0);
         return zns_zone_append(n, req, plp);
     }
 
@@ -1373,6 +1614,8 @@ static void zns_exit(FemuCtrl *n)
 
 int nvme_register_znssd(FemuCtrl *n)
 {
+	//timer_t *timerID;
+
     n->ext_ops = (FemuExtCtrlOps) {
         .state            = NULL,
         .init             = zns_init,
@@ -1383,6 +1626,13 @@ int nvme_register_znssd(FemuCtrl *n)
         .io_cmd           = zns_io_cmd,
         .get_log          = NULL,
     };
+
+	//timerID = (timer_t *)malloc(sizeof(timer_t));
+	//SetTimerInterrupt(timerID, 5, 0);
+
+	map_init(&qsg2flashaddr);
+
+	sem_init(&sem, 0, 1);
 
     return 0;
 }
